@@ -36,5 +36,5 @@
 # D:/clash/yamls
 
 # 本地 YAML 文件
-tested_within.yaml
-subscriptions
+# tested_within.yaml
+subscriptions/SFZY666.yaml

@@ -128,6 +128,7 @@ class ProxyNode:
                 password=data.get('password', ''),
                 sni=data.get('sni', ''),
                 skip_cert_verify=data.get('skip-cert-verify', False),
+                reality_short_id=data.get('short-id', ''),
                 raw_config=data
             )
         else:
@@ -199,6 +200,14 @@ class ProxyNode:
                 result['sni'] = self.sni
             if self.skip_cert_verify is not None:
                 result['skip-cert-verify'] = self.skip_cert_verify
+            # short-id 必须是 8 个十六进制字符或为空
+            if self.reality_short_id:
+                import re
+                if re.match(r'^[0-9a-fA-F]{1,8}$', self.reality_short_id):
+                    result['short-id'] = self.reality_short_id.lower()
+                else:
+                    # 无效的 short-id，清除它
+                    pass
         
         return result
 
@@ -417,6 +426,69 @@ def parse_vless_link(vless_str: str) -> Optional[Dict]:
         return None
 
 
+def parse_hysteria_link(hysteria_str: str) -> Optional[Dict]:
+    """解析 hysteria 链接"""
+    try:
+        if not hysteria_str.startswith('hysteria://') and not hysteria_str.startswith('hy2://'):
+            return None
+        
+        # 移除 hysteria:// 或 hy2:// 前缀
+        hysteria_part = hysteria_str.replace('hysteria://', '').replace('hy2://', '')
+        
+        # 分离服务器信息和参数
+        if '#' in hysteria_part:
+            server_part, name = hysteria_part.split('#', 1)
+            name = base64.b64decode(name.replace('-', '+').replace('_', '/') + '==').decode('utf-8')
+        else:
+            server_part = hysteria_part
+            name = 'Hysteria'
+        
+        # 解析服务器信息
+        if '@' in server_part:
+            password, server_info = server_part.split('@', 1)
+        else:
+            password = ''
+            server_info = server_part
+        
+        # 解析参数
+        if '?' in server_info:
+            server_port, params = server_info.split('?', 1)
+        else:
+            server_port = server_info
+            params = ''
+        
+        if ':' in server_port:
+            server, port = server_port.rsplit(':', 1)
+        else:
+            server = server_port
+            port = 443
+        
+        # 解析额外参数
+        sni = ''
+        skip_cert_verify = False
+        
+        for param in params.split('&'):
+            if '=' in param:
+                key, value = param.split('=', 1)
+                if key == 'sni':
+                    sni = value
+                elif key == 'insecure':
+                    skip_cert_verify = value == '1' or value.lower() == 'true'
+        
+        return {
+            'name': name,
+            'type': 'hysteria2',
+            'server': server,
+            'port': int(port),
+            'password': password,
+            'sni': sni,
+            'skip-cert-verify': skip_cert_verify,
+        }
+    except Exception as e:
+        print(f"解析 hysteria 链接失败: {e}")
+        return None
+
+
 def fetch_subscription(url: str) -> List[ProxyNode]:
     """获取订阅内容并解析节点"""
     nodes = []
@@ -475,6 +547,8 @@ def fetch_subscription(url: str) -> List[ProxyNode]:
                 node_data = parse_trojan_link(line)
             elif line.startswith('vless://'):
                 node_data = parse_vless_link(line)
+            elif line.startswith('hysteria://') or line.startswith('hy2://'):
+                node_data = parse_hysteria_link(line)
             
             if node_data:
                 nodes.append(ProxyNode.from_dict(node_data))
@@ -627,6 +701,11 @@ def parse_source(source: str) -> List[ProxyNode]:
         if node_data:
             nodes.append(ProxyNode.from_dict(node_data))
         return nodes
+    elif source.startswith('hysteria://') or source.startswith('hy2://'):
+        node_data = parse_hysteria_link(source)
+        if node_data:
+            nodes.append(ProxyNode.from_dict(node_data))
+        return nodes
     
     print(f"  无法识别的源格式: {source}")
     return nodes
@@ -683,7 +762,8 @@ def test_node_speed(node: ProxyNode) -> Optional[float]:
         
         elapsed = time.time() - start_time
         
-        if response.status_code in [200, 204]:
+        # 状态码必须为 200 才算可用
+        if response.status_code == 200:
             return elapsed
         return None
         
@@ -780,43 +860,27 @@ def test_all_nodes(nodes: List[ProxyNode], test_method: str = 'connect') -> List
 
 
 def generate_clash_config(nodes: List[ProxyNode], output_path: str, config_name: str = "Merged Config"):
-    """生成 clash.yaml 配置文件"""
-    
-    # 基本配置模板
-    clash_config = {
-        'port': 7890,
-        'socks-port': 7891,
-        'redir-port': 7892,
-        'mixed-port': 7893,
-        'allow-lan': False,
-        'mode': 'rule',
-        'log-level': 'info',
-        'external-controller': '127.0.0.1:9090',
-        'dns': {
-            'enable': True,
-            'listen': '0.0.0.0:53',
-            'enhanced-mode': 'fake-ip',
-            'fake-ip-range': '198.18.0.1/16',
-            'nameserver': ['223.5.5.5', '119.29.29.29'],
-            'fallback': ['8.8.8.8', '1.1.1.1'],
-            'fallback-filter': {
-                'geoip': True,
-                'geoip-code': 'CN'
-            }
-        }
-    }
+    """生成 clash.yaml 配置文件（兼容 Clash/Mihomo 传统格式）"""
     
     # 添加代理节点
     proxies = []
     for node in nodes:
         proxies.append(node.to_dict())
     
-    # 添加代理组
+    # 获取所有节点名称
+    all_proxy_names = [p['name'] for p in proxies]
+    
+    # 辅助函数：筛选地区节点，如果为空则使用所有节点
+    def filter_region(proxy_list, keywords):
+        filtered = [p['name'] for p in proxy_list if any(kw in p['name'] for kw in keywords)]
+        return filtered if filtered else all_proxy_names
+    
+    # 添加代理组（传统 Clash 格式）
     proxy_groups = [
         {
             'name': config_name,
             'type': 'url-test',
-            'proxies': [p['name'] for p in proxies],
+            'proxies': all_proxy_names,
             'url': 'http://www.gstatic.com/generate_204',
             'interval': 300,
             'tolerance': 50
@@ -824,7 +888,7 @@ def generate_clash_config(nodes: List[ProxyNode], output_path: str, config_name:
         {
             'name': '自动选择',
             'type': 'url-test',
-            'proxies': [p['name'] for p in proxies],
+            'proxies': all_proxy_names,
             'url': 'http://www.gstatic.com/generate_204',
             'interval': 300,
             'tolerance': 50
@@ -832,62 +896,73 @@ def generate_clash_config(nodes: List[ProxyNode], output_path: str, config_name:
         {
             'name': '故障转移',
             'type': 'fallback',
-            'proxies': [p['name'] for p in proxies],
+            'proxies': all_proxy_names,
             'url': 'http://www.gstatic.com/generate_204',
             'interval': 300
         },
         {
             'name': '负载均衡',
             'type': 'load-balance',
-            'proxies': [p['name'] for p in proxies],
+            'proxies': all_proxy_names,
             'url': 'http://www.gstatic.com/generate_204',
             'interval': 300,
             'strategy': 'consistent-hashing'
         },
         {
-            'name': '🇭🇰 香港节点',
+            'name': 'HK',
             'type': 'url-test',
-            'proxies': [p['name'] for p in proxies if '香港' in p['name'] or 'HK' in p['name'] or 'HongKong' in p['name']],
+            'proxies': filter_region(proxies, ['香港', 'HK', 'HongKong', 'hongkong']),
             'url': 'http://www.gstatic.com/generate_204',
             'interval': 300
         },
         {
-            'name': '🇺🇸 美国节点',
+            'name': 'US',
             'type': 'url-test',
-            'proxies': [p['name'] for p in proxies if '美国' in p['name'] or 'US' in p['name'] or 'America' in p['name']],
+            'proxies': filter_region(proxies, ['美国', 'US', 'America', 'USA']),
             'url': 'http://www.gstatic.com/generate_204',
             'interval': 300
         },
         {
-            'name': '🇯🇵 日本节点',
+            'name': 'JP',
             'type': 'url-test',
-            'proxies': [p['name'] for p in proxies if '日本' in p['name'] or 'JP' in p['name'] or 'Japan' in p['name']],
+            'proxies': filter_region(proxies, ['日本', 'JP', 'Japan']),
             'url': 'http://www.gstatic.com/generate_204',
             'interval': 300
         },
         {
-            'name': '🇸🇬 新加坡节点',
+            'name': 'SG',
             'type': 'url-test',
-            'proxies': [p['name'] for p in proxies if '新加坡' in p['name'] or 'SG' in p['name'] or 'Singapore' in p['name']],
+            'proxies': filter_region(proxies, ['新加坡', 'SG', 'Singapore']),
             'url': 'http://www.gstatic.com/generate_204',
             'interval': 300
         },
         {
-            'name': '🐟 漏网之鱼',
+            'name': 'Other',
             'type': 'select',
-            'proxies': ['DIRECT'] + [p['name'] for p in proxies]
+            'proxies': ['DIRECT'] + all_proxy_names
         }
     ]
     
     # 规则
     rules = [
         'GEOIP,CN,DIRECT',
-        'MATCH,🐟 漏网之鱼'
+        'MATCH,Other'
     ]
     
-    clash_config['proxies'] = proxies
-    clash_config['proxy-groups'] = proxy_groups
-    clash_config['rules'] = rules
+    # 生成完整配置（简化为 Clash Premium/Mihomo 兼容格式）
+    clash_config = {
+        'port': 7890,
+        'socks-port': 7891,
+        'redir-port': 7892,
+        'mixed-port': 7893,
+        'allow-lan': True,
+        'mode': 'rule',
+        'log-level': 'info',
+        'external-controller': '127.0.0.1:9090',
+        'proxies': proxies,
+        'proxy-groups': proxy_groups,
+        'rules': rules
+    }
     
     # 写入文件
     with open(output_path, 'w', encoding='utf-8') as f:
